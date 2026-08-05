@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+pdfplumber
+requests
+sentence-transformers
+nltk
