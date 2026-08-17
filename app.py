@@ -14,9 +14,11 @@ app = FastAPI()
 
 # --- Connexion au modèle Granite ---
 url = os.environ.get("MODEL_URL")
-
-with open("/var/run/secrets/kubernetes.io/serviceaccount/token", "r") as f:
-    token = f.read().strip()
+try:
+    with open("/var/run/secrets/kubernetes.io/serviceaccount/token", "r") as f:
+        token = f.read().strip()
+except FileNotFoundError:
+    token = "local-dev-token"
 
 headers = {
     "Authorization": f"Bearer {token}",
