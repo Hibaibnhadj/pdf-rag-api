@@ -5,6 +5,7 @@ import requests
 from sentence_transformers import SentenceTransformer, util
 from nltk.tokenize import sent_tokenize
 import nltk
+import os
 
 nltk.download('punkt')
 nltk.download('punkt_tab')
@@ -12,7 +13,7 @@ nltk.download('punkt_tab')
 app = FastAPI()
 
 # --- Connexion au modèle Granite ---
-url = "https://isvc-granite-31-8b-fp8-predictor.sandbox-shared-models.svc.cluster.local:8443/v1/chat/completions"
+url = os.environ.get("MODEL_URL")
 
 with open("/var/run/secrets/kubernetes.io/serviceaccount/token", "r") as f:
     token = f.read().strip()
