@@ -1,16 +1,63 @@
-﻿# PDF RAG API
+# PDF RAG API
 
 A FastAPI service for question-answering over PDF documents using retrieval-augmented generation (RAG).
+
+## Pipeline (how it works)
+
+Before any deployment or CI/CD concerns, the core of this project is a Retrieval-Augmented Generation (RAG) pipeline: given a PDF and a question, retrieve the relevant parts of the document and generate an answer grounded in that content, using an existing LLM (no model is trained or fine-tuned).
+
+### 1. PDF text extraction
+
+Text is extracted page-by-page using `pdfplumber`. Extraction is purely text-based; scanned/image-only PDFs are not currently handled (no OCR step).
+
+### 2. Chunking
+
+The extracted text is split into overlapping-free, sentence-respecting chunks before embedding:
+
+- Sentence boundaries are detected with NLTK's `sent_tokenize` (French tokenizer).
+- Sentences are grouped into chunks up to a target size (`max_chars`, default 500), so a chunk is never cut mid-sentence.
+- An earlier fixed-character-count version (naive `text[i:i+500]` slicing) was replaced by this sentence-aware version after it was found to regularly cut chunks mid-sentence, degrading retrieval quality.
+
+### 3. Embedding and retrieval
+
+Each chunk is embedded using `sentence-transformers` (`all-MiniLM-L6-v2`, 384-dim vectors), loaded once at startup. At query time:
+
+1. The question is embedded with the same model.
+2. Cosine similarity is computed between the question and every chunk.
+3. The top `top_k` chunks are selected as context for the LLM.
+
+**`top_k` tuning:** `top_k=2` was the initial default but was found to miss answers that require combining information from two different sections of a document (verified with a test question spanning an incident report and a separate budget section). Increasing to `top_k=4` retrieved the correct combined context and produced a correct answer. `top_k=4` is now the default; lower values remain usable for single-fact questions where speed matters more than cross-referencing.
+
+### 4. Answer generation
+
+The selected chunks are concatenated and inserted into a single prompt along with the question, then sent to an LLM already deployed on the cluster — no model is trained as part of this project.
+
+- **Model:** Granite 3.1 8B (FP8), served via KServe using a vLLM-based runtime (RHAIIS), exposed through an OpenAI-compatible API (`/v1/chat/completions`).
+- **Endpoint:** internal to the cluster (`isvc-granite-31-8b-fp8-predictor.sandbox-shared-models.svc.cluster.local:8443`), authenticated using the pod's Kubernetes service-account token as a bearer token — no separate API key is stored.
+- The model is instructed to answer only from the provided extracts. Testing confirmed it correctly reports when an answer isn't present in the retrieved context rather than fabricating one.
+
+### Prompt template
+
+```
+Voici des extraits pertinents d'un document :
+
+{context}
+
+Réponds à la question suivante en te basant uniquement sur ces extraits :
+{question}
+```
+
+This pipeline (extraction → chunk → embed → retrieve → prompt → generate) is what the `/ask` endpoint described below executes on every request, with the addition of an in-memory embedding cache described in "Architecture."
 
 ## Architecture
 
 The API is a FastAPI service. Single endpoint: `POST /ask`, expects `{"pdf_path": "...", "question": "..."}`, returns `{"answer": "..."}`.
 
-**Request pipeline:**
+Request pipeline:
 
 The embedding model is loaded once at application startup and kept in memory for the pod's lifetime.
 
-**In-memory embedding cache:** chunk embeddings for a given PDF are cached in memory, keyed by (file path, last-modified time). A second question about an already-seen PDF skips re-reading, re-chunking, and re-embedding entirely. See "Performance & load testing" for measured impact. Known limitation: this cache lives in the pod's RAM only, is lost on every pod restart, and does not help concurrent first-time requests (see below).
+In-memory embedding cache: chunk embeddings for a given PDF are cached in memory, keyed by (file path, last-modified time). A second question about an already-seen PDF skips re-reading, re-chunking, and re-embedding entirely. See "Performance & load testing" for measured impact. Known limitation: this cache lives in the pod's RAM only, is lost on every pod restart, and does not help concurrent first-time requests (see below).
 
 ## Deployment (OpenShift)
 
@@ -24,23 +71,23 @@ The app is deployed on OpenShift (`hiba1-dev` project) using:
 | Service | `pdf-rag-api` | Internal networking, port 8000 |
 | Route | `pdf-rag-api` | Public HTTP endpoint |
 
-**Secrets:** the LLM endpoint URL (`MODEL_URL`), previously hardcoded in `app.py`, is now stored in an OpenShift Secret (`pdf-rag-api-secrets`, type Opaque, key `MODEL_URL`) and injected into the DeploymentConfig as an environment variable. The app reads it at startup via `os.environ.get("MODEL_URL")`. No sensitive values remain in source code or on GitHub. The bearer token used to authenticate to the LLM endpoint is handled separately via the pod's Kubernetes service-account token (`/var/run/secrets/kubernetes.io/serviceaccount/token`), a native, already-secure mechanism.
+**Secrets:** the LLM endpoint URL (`MODEL_URL`), previously hardcoded in `app.py`, is now stored in an OpenShift Secret (`pdf-rag-api-secrets`, type `Opaque`, key `MODEL_URL`) and injected into the DeploymentConfig as an environment variable. The app reads it at startup via `os.environ.get("MODEL_URL")`. No sensitive values remain in source code or on GitHub. The bearer token used to authenticate to the LLM endpoint is handled separately via the pod's Kubernetes service-account token (`/var/run/secrets/kubernetes.io/serviceaccount/token`), a native, already-secure mechanism.
 
-**Container runtime note:** OpenShift runs containers as a non-root, randomly assigned UID. Anything written to disk at runtime (e.g. NLTK's tokenizer data) must go to a writable path, hence `NLTK_DATA=/tmp/nltk_data` and `HOME=/tmp`. Writing to the app's working directory (e.g. `/app`) fails with a PermissionError.
+**Container runtime note:** OpenShift runs containers as a non-root, randomly assigned UID. Anything written to disk at runtime (e.g. NLTK's tokenizer data) must go to a writable path, hence `NLTK_DATA=/tmp/nltk_data` and `HOME=/tmp`. Writing to the app's working directory (e.g. `/app`) fails with a `PermissionError`.
 
-**Known operational note:** the OpenShift Developer Sandbox auto-scales idle deployments to 0 replicas after a period of inactivity. If the API appears down, check DeploymentConfigs -> pdf-rag-api -> Details for the replica count and scale back to 1 if needed.
+**Known operational note:** the OpenShift Developer Sandbox auto-scales idle deployments to 0 replicas after a period of inactivity. If the API appears down, check DeploymentConfigs -> `pdf-rag-api` -> Details for the replica count and scale back to 1 if needed.
 
 ## CI/CD pipeline
 
-The pipeline runs automatically on every git push to main. As of this writing it has three sequential Tekton tasks (updated from an earlier two-task version):
+The pipeline runs automatically on every git push to `main`. As of this writing it has three sequential Tekton tasks (updated from an earlier two-task version):
 
 1. **clone-repo** - clones the repository into a shared workspace.
 2. **run-tests** - installs dependencies and runs `pytest tests/ -v`.
 3. **trigger-build** - if tests pass, runs `oc start-build pdf-rag-api --wait`, rebuilding the Docker image and pushing it to the internal registry. The DeploymentConfig's ImageChange trigger then automatically rolls out a new pod.
 
-This closes a gap found during testing: earlier, a push would run tests but not rebuild/redeploy the image, the BuildConfig had to be triggered manually, meaning tested code could sit un-deployed for some time (in one case, about two weeks) before someone noticed and triggered a build by hand. With trigger-build in place and verified end-to-end, a successful push now results in tested code actually running in production with no manual step.
+This closes a gap found during testing: earlier, a push would run tests but not rebuild/redeploy the image, the BuildConfig had to be triggered manually, meaning tested code could sit un-deployed for some time (in one case, about two weeks) before someone noticed and triggered a build by hand. With `trigger-build` in place and verified end-to-end, a successful push now results in tested code actually running in production with no manual step.
 
-**Supporting Tekton resources:**
+Supporting Tekton resources:
 
 | Resource | Name | Purpose |
 |---|---|---|
@@ -50,27 +97,30 @@ This closes a gap found during testing: earlier, a push would run tests but not 
 | EventListener | `pdf-rag-api-event-listener` | Receives webhook calls, starts a PipelineRun |
 | Route | `pdf-rag-api-eventlistener` | Exposes the EventListener publicly so GitHub can reach it |
 
-GitHub's repository webhook (Settings -> Webhooks) points at the EventListener's Route. On every push to main, GitHub calls that URL, the EventListener creates a new PipelineRun, and clone -> test -> build runs automatically.
+GitHub's repository webhook (Settings -> Webhooks) points at the EventListener's Route. On every push to `main`, GitHub calls that URL, the EventListener creates a new PipelineRun, and clone -> test -> build runs automatically.
 
-**Manually re-running the pipeline** (e.g. to test without pushing): OpenShift Console -> Pipelines -> Pipelines -> pdf-rag-api-pipeline -> Actions -> Demarrer, choose the VolumeClaimTemplate for shared-workspace, and start.
+**Manually re-running the pipeline** (e.g. to test without pushing): OpenShift Console -> Pipelines -> Pipelines -> `pdf-rag-api-pipeline` -> Actions -> Démarrer, choose the VolumeClaimTemplate for `shared-workspace`, and start.
 
-**Design note - why an EventListener instead of a direct BuildConfig webhook:** a direct GitHub webhook pointed at the BuildConfig's Kubernetes API webhook URL is blocked on this cluster, the Developer Sandbox's RBAC policy denies anonymous external requests to the raw Kubernetes API (system:anonymous cannot create buildconfigs/webhooks). The same restriction blocks direct cluster-scope access to Tekton resources. Exposing a Tekton EventListener through an OpenShift Route sidesteps this: the EventListener is a normal application-level HTTP service, not a raw API call, so it isn't subject to the same RBAC restriction.
+**Design note - why an EventListener instead of a direct BuildConfig webhook:** a direct GitHub webhook pointed at the BuildConfig's Kubernetes API webhook URL is blocked on this cluster, the Developer Sandbox's RBAC policy denies anonymous external requests to the raw Kubernetes API (`system:anonymous` cannot create `buildconfigs/webhooks`). The same restriction blocks direct cluster-scope access to Tekton resources. Exposing a Tekton EventListener through an OpenShift Route sidesteps this: the EventListener is a normal application-level HTTP service, not a raw API call, so it isn't subject to the same RBAC restriction.
 
-**Other environment quirks handled by the pipeline:**
-- run-tests runs in a plain python:3.12-slim image, not the project's own Dockerfile, so NLTK setup is configured explicitly in the Tekton task.
-- NLTK's SSRF protection blocks tokenizer downloads through this cluster's egress proxy unless NLTK_ALLOW_PROXIED_URLOPEN=1 is set.
+Other environment quirks handled by the pipeline:
+
+- `run-tests` runs in a plain `python:3.12-slim` image, not the project's own Dockerfile, so NLTK setup is configured explicitly in the Tekton task.
+- NLTK's SSRF protection blocks tokenizer downloads through this cluster's egress proxy unless `NLTK_ALLOW_PROXIED_URLOPEN=1` is set.
 - Each PipelineRun creates a PersistentVolumeClaim for its workspace. The Developer Sandbox limits a namespace to 10 PVCs total. Old, completed PipelineRuns should be deleted periodically (this cascades to delete their PVCs), otherwise new runs hang in Pending once the quota is hit. This cleanup is currently manual.
 
 ## Running the tests
 
-Tests live in `tests/test_app.py` and use pytest. Current coverage (14 tests):
-- **Chunking logic** - basic splitting, empty input, respecting max_chars, no content loss across chunk boundaries, a single sentence longer than the limit.
+Tests live in `tests/test_app.py` and use `pytest`. Current coverage (14 tests):
+
+- **Chunking logic** - basic splitting, empty input, respecting `max_chars`, no content loss across chunk boundaries, a single sentence longer than the limit.
 - **PDF reading** - correct text extraction from a real PDF, graceful failure on a missing file.
-- **API endpoint (/ask)** - success case (LLM call mocked), missing-field validation, wrong-type validation, internal error propagation.
+- **API endpoint (`/ask`)** - success case (LLM call mocked), missing-field validation, wrong-type validation, internal error propagation.
 - **Integration test** - verifies the retrieval pipeline (chunk -> embed -> similarity search) actually selects the relevant chunk and passes correct content to the LLM prompt (only the external LLM call is mocked).
 
-**Locally:**
-```bash
+Locally:
+
+```
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
@@ -78,9 +128,9 @@ pip install pytest httpx
 pytest tests/ -v
 ```
 
-Note: app.py reads a Kubernetes service-account token at import time. Locally (outside a pod) this file doesn't exist, so the read is wrapped in try/except FileNotFoundError, falling back to token = "local-dev-token" so the app and tests can run outside OpenShift.
+Note: `app.py` reads a Kubernetes service-account token at import time. Locally (outside a pod) this file doesn't exist, so the read is wrapped in `try/except FileNotFoundError`, falling back to `token = "local-dev-token"` so the app and tests can run outside OpenShift.
 
-**Automatically:** just git push to main; check status under Pipelines -> PipelineRuns.
+Automatically: just `git push` to `main`; check status under Pipelines -> PipelineRuns.
 
 ## Performance & load testing
 
@@ -121,13 +171,13 @@ Not implemented within the available time. Recommendation for a future iteration
 
 ## Recommended next steps
 
-1. Increase the pod's memory limit (e.g. 1Gi -> 2Gi), quick mitigation for large single documents.
-2. Introduce a persistent vector store (see above).
-3. Add request queuing or concurrency limiting on /ask.
-4. Automate periodic cleanup of old PipelineRuns/PVCs (currently manual).
+- Increase the pod's memory limit (e.g. 1Gi -> 2Gi), quick mitigation for large single documents.
+- Introduce a persistent vector store (see above).
+- Add request queuing or concurrency limiting on `/ask`.
+- Automate periodic cleanup of old PipelineRuns/PVCs (currently manual).
 
 ## Known limitations
 
 - Embedding cache is in-memory only; lost on pod restart.
-- No authentication or rate-limiting on /ask.
+- No authentication or rate-limiting on `/ask`.
 - Old PipelineRun/PVC cleanup is manual.
